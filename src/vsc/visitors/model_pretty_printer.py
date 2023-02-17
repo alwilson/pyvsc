@@ -133,7 +133,16 @@ class ModelPrettyPrinter(ModelVisitor):
             self.dec_indent()
             
         self.writeln("}")
-        
+
+    def visit_constraint_soft(self, c:vm.ConstraintSoftModel):
+        if isinstance(c.expr, vm.ExprBinModel):
+            self.write(self.ind + "soft ")
+            c.expr.accept(self)
+            self.write("\n")
+        else:
+            # TODO Ignore constraint scopes for now
+            c.expr.accept(self)
+
     def visit_constraint_implies(self, c:vm.ConstraintImpliesModel):
         self.write(self.ind)
         c.cond.accept(self)

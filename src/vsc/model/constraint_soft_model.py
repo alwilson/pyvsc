@@ -12,8 +12,9 @@ class ConstraintSoftModel(ConstraintModel):
     
     def __init__(self, e : ExprModel):
         super().__init__()
-        if not isinstance(e, ExprModel):
-            raise Exception("SoftModel expr type error")
+        # TODO What was this preventing? Allow for extracting nested soft constraints?
+        # if not isinstance(e, ExprModel):
+        #     raise Exception("SoftModel expr type error")
         self.expr = e
         self.priority = 0
 

@@ -24,6 +24,7 @@ import os
 
 from vsc.impl.coverage_registry import CoverageRegistry
 from vsc.model.constraint_expr_model import ConstraintExprModel
+from vsc.model.constraint_soft_model import ConstraintSoftModel
 
 
 rand_obj_type_m = {}
@@ -128,6 +129,32 @@ def push_constraint_stmt(s):
         c.srcinfo = e.srcinfo
         constraint_scope_stack[-1].constraint_l.append(c)
     constraint_scope_stack[-1].constraint_l.append(s)
+
+    # Isolate stack for each soft constraint and add as separate constraint
+    if constraint_scope_depth() > 1 and isinstance(s, ConstraintSoftModel):
+        # Grab that lastest scope from each stack
+        soft_stack = []
+        for scope in constraint_scope_stack:
+            soft_stack.append(scope.constraint_l[-1])
+
+        # Clone everything except the last element, the soft constraint
+        soft_stack_copy = [s.clone(deep=True) for s in soft_stack[:-1]] + [soft_stack[-1]]
+
+        # Stitch all the if_else statements together
+        # TODO What about all other scoping constraints? Implies? ForEach? Array?
+        for scope, next_scope in zip(soft_stack_copy[:-1], soft_stack_copy[1:]):
+            if hasattr(scope, 'true_c'):
+                scope.true_c.constraint_l = [next_scope]
+
+        # Stick new stack inside soft constraint
+        inner_soft = soft_stack_copy[0]
+        new_soft = ConstraintSoftModel(inner_soft)
+
+        # Push new soft constraint stack to top of scope
+        constraint_scope_stack[0].constraint_l.insert(0, new_soft)
+
+        # Remove soft constraint from original stack
+        constraint_scope_stack[-1].constraint_l.pop()
     
 def pop_constraint_scope():
     for e in pop_exprs():
