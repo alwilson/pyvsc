@@ -15,9 +15,10 @@ from vsc.model.field_scalar_model import FieldScalarModel
 from vsc.model.rand_set import RandSet
 from vsc.model.rand_state import RandState
 from vsc.model.variable_bound_model import VariableBoundModel
-
+import os
 
 class SolveGroupSwizzlerPartsel(object):
+    cached = {}
     
     def __init__(self, randstate, solve_info, debug=0):
         self.debug = debug
@@ -38,7 +39,50 @@ class SolveGroupSwizzlerPartsel(object):
             
         if self.debug > 0:
             print("  " + str(len(field_l)) + " fields in randset")
-            
+
+        if 'PYVSC_CACHE_RANGE' in os.environ:
+            # Use temporary file to dump boolector model
+            # TODO Is there a way to redirect stdout from compiled python libraries?
+            # TODO Add feature to boolector to get hash or model directly?
+            tmp_model_file = '.pyvsc_model'
+            btor.Dump(format='btor', outfile=tmp_model_file)
+            model_key = open(tmp_model_file).read()
+            os.remove(tmp_model_file)
+
+            # Check if we've explored min/max before
+            if not model_key in self.cached:
+                self.cached[model_key] = {}
+                for f in rs.rand_fields():
+                    if f in bound_m.keys():
+                        f_bound = bound_m[f]
+                        if not f_bound.isEmpty():
+                            range_l = f_bound.domain.range_l
+                            # TODO How to handle multiple ranges?
+                            t_range = range_l[0]
+
+                            maxval = int(max(abs(t_range[0]), abs(t_range[1])))
+                            d_width = 0
+                            while maxval > 0:
+                                d_width += 1
+                                maxval >>= 1
+
+                            if self.debug: print('before', f, t_range, d_width)
+                            t_range, d_width = self.find_max(f, btor, t_range, d_width)
+                            t_range, d_width = self.find_min(f, btor, t_range, d_width)
+                            f_bound.domain.range_l[0] = t_range
+                            if self.debug: print('after', f, t_range, d_width)
+                            self.cached[model_key][str(f)] = (t_range, d_width)
+
+                            # TODO Try setting rand_state and randomly solving using new ranges
+            else:
+                for f in rs.rand_fields():
+                    if f in bound_m.keys():
+                        f_bound = bound_m[f]
+                        if not f_bound.isEmpty():
+                            t_range, d_width = self.cached[model_key][str(f)]
+                            f_bound.domain.range_l[0] = t_range
+                            if self.debug: print('found', f, t_range, d_width)
+
         if rs.rand_order_l is not None:
             # Perform an ordered randomization
             for ro_l in rs.rand_order_l:
@@ -55,13 +99,13 @@ class SolveGroupSwizzlerPartsel(object):
             print("<-- swizzle_randvars")    
             
     def swizzle_field_l(self, field_l, rs : RandSet, bound_m, btor):
-        e = None
         if len(field_l) > 0:
             # Make a copy of the field list so we don't
             # destroy the original
             field_l = field_l.copy()
             
             swizzle_node_l = []
+            rand_range_l = []
             max_swizzle = 4
 
             # Select up to `max_swizzle` fields to swizzle            
@@ -69,27 +113,78 @@ class SolveGroupSwizzlerPartsel(object):
                 if len(field_l) > 0:
                     field_idx = self.randstate.randint(0, len(field_l)-1)
                     f = field_l.pop(field_idx)
-                    e_l = self.swizzle_field(f, rs, bound_m)
+                    e_l, t_range = self.swizzle_field(f, rs, bound_m, btor)
+                    # print(f.name, e_l, t_range)
                     if e_l is not None:
                         for e in e_l:
                             swizzle_node_l.append(e.build(btor))
+                        rand_range_l.append((f, t_range))
                 else:
                     break
 
-            # Each entry in the nodelist corresponds to a field
-            while (len(swizzle_node_l) > 0):
-                idx = self.randstate.randint(0, len(swizzle_node_l)-1)
-                n = swizzle_node_l.pop(idx)
-                btor.Assume(n)
-                if self.solve_info is not None:
-                    self.solve_info.n_sat_calls += 1
-                if btor.Sat() == btor.SAT:
-                    if self.debug > 0:
-                        print("  Constraint SAT")
-                    btor.Assert(n)
-                else:
-                    if self.debug > 0:
-                        print("  Constraint UNSAT")
+                if 'PYVSC_TRUE_RANGE' in os.environ:
+                    # Each entry in the nodelist corresponds to a field
+                    while (len(swizzle_node_l) > 0):
+                        idx = self.randstate.randint(0, len(swizzle_node_l)-1)
+                        n = swizzle_node_l.pop(idx)
+                        btor.Assume(n)
+                        if self.solve_info is not None:
+                            self.solve_info.n_sat_calls += 1
+                        if btor.Sat() == btor.SAT:
+                            if self.debug > 0:
+                                print("  Constraint SAT")
+                            btor.Assert(n)
+                        else:
+                            if self.debug > 0:
+                                print("  Constraint UNSAT")
+
+            if not 'PYVSC_TRUE_RANGE' in os.environ:
+                rand_range_tries = 0
+                if 'PYVSC_RAND_RANGE' in os.environ:
+                    rand_range_tries = 4
+                    while rand_range_tries > 0:
+                        vals = []
+                        for f, t_range in rand_range_l:
+                            if self.debug > 0:
+                                print(f'  {f.name} {t_range}')
+                            if t_range[0] == t_range[1]:
+                                val = t_range[0]
+                            else:
+                                val = self.randstate.randint(t_range[0], t_range[1])
+                            vals.append((f, val))
+                            btor.Assume(ExprBinModel(
+                                ExprFieldRefModel(f),
+                                BinExprType.Eq,
+                                ExprLiteralModel(val, False, 32)).build(btor))
+                        if btor.Sat() == btor.SAT:
+                            if self.debug > 0:
+                                print("  Constraint SAT")
+                            for f, val in vals:
+                                btor.Assert(ExprBinModel(
+                                    ExprFieldRefModel(f),
+                                    BinExprType.Eq,
+                                    ExprLiteralModel(val, False, 32)).build(btor))
+                            break
+                        else:
+                            if self.debug > 0:
+                                print("  Constraint UNSAT")
+                            rand_range_tries -= 1
+
+                if rand_range_tries == 0:
+                    # Each entry in the nodelist corresponds to a field
+                    while (len(swizzle_node_l) > 0):
+                        idx = self.randstate.randint(0, len(swizzle_node_l)-1)
+                        n = swizzle_node_l.pop(idx)
+                        btor.Assume(n)
+                        if self.solve_info is not None:
+                            self.solve_info.n_sat_calls += 1
+                        if btor.Sat() == btor.SAT:
+                            if self.debug > 0:
+                                print("  Constraint SAT")
+                            btor.Assert(n)
+                        else:
+                            if self.debug > 0:
+                                print("  Constraint UNSAT")
 
             if self.solve_info is not None:
                 self.solve_info.n_sat_calls += 1
@@ -102,8 +197,10 @@ class SolveGroupSwizzlerPartsel(object):
     def swizzle_field(self,
                       f : FieldScalarModel,
                       rs : RandSet,
-                      bound_m : VariableBoundModel)->ExprModel:
+                      bound_m : VariableBoundModel,
+                      btor)->tuple[ExprModel, tuple[int, int]]:
         ret = None
+        t_range = (None, None)
         
         if self.debug > 0:
             print("Swizzling field %s" % f.name)
@@ -133,6 +230,7 @@ class SolveGroupSwizzlerPartsel(object):
                     ExprFieldRefModel(f),
                     BinExprType.Eq,
                     ExprLiteralModel(val, f.is_signed, f.width))]
+                t_range = (val, val)
             else:
                 # Single value
                 val = target_w.rng_lhs.val()
@@ -142,17 +240,19 @@ class SolveGroupSwizzlerPartsel(object):
                     ExprFieldRefModel(f),
                     BinExprType.Eq,
                     ExprLiteralModel(int(val), f.is_signed, f.width))]
+                t_range = (val, val)
         else:
             if f in bound_m.keys():
                 f_bound = bound_m[f]
                 if not f_bound.isEmpty():
-                    ret = self.create_rand_domain_constraint(f, f_bound)
+                    ret, t_range = self.create_rand_domain_constraint(f, f_bound, btor)
                     
-        return ret
+        return ret, t_range
     
     def create_rand_domain_constraint(self, 
                 f : FieldScalarModel, 
-                bound_m : VariableBoundModel)->ExprModel:
+                bound_m : VariableBoundModel,
+                btor)->tuple[ExprModel, tuple[int, int]]:
         e = []
         range_l = bound_m.domain.range_l
         
@@ -190,14 +290,139 @@ class SolveGroupSwizzlerPartsel(object):
     
             if self.debug > 0:
                 print("d_width: %d" % d_width)                
-                
+
+            if 'PYVSC_MINMAX' in os.environ or 'PYVSC_TRUE_RANGE' in os.environ:
+                t_range, d_width = self.find_max(f, btor, t_range, d_width)
+                t_range, d_width = self.find_min(f, btor, t_range, d_width)
+
             bit_pattern = self.randstate.randint(t_range[0], t_range[1])
             e = self._build_swizzle_constraints(f, bit_pattern, d_width)
 
-        return e
-    
+        return e, t_range
+
+    def find_max(self, f, btor, t_range, d_width):
+        btor.Assume(ExprBinModel(
+            ExprFieldRefModel(f),
+            BinExprType.Eq,
+            ExprLiteralModel(t_range[1], False, 32)).build(btor))
+        if self.solve_info is not None:
+            self.solve_info.n_sat_calls += 1
+        if btor.Sat() == btor.SAT:
+            if self.debug > 0:
+                print("  current max: Constraint SAT")
+            return t_range, d_width
+
+        skip_size = 6
+        skip_d_width = d_width
+        for i in range(d_width)[::-skip_size]:
+            if i < skip_size:
+                break
+            b = ExprBinModel(
+                    ExprPartselectModel(
+                        ExprFieldRefModel(f),
+                        ExprLiteralModel(i,   False, 32),
+                        ExprLiteralModel(i-skip_size, False, 32)),
+                    BinExprType.Ne,
+                    ExprLiteralModel(0, False, skip_size)
+                    )
+
+            n = b.build(btor)
+            btor.Assume(n)
+            if self.solve_info is not None:
+                self.solve_info.n_sat_calls += 1
+            if btor.Sat() == btor.SAT:
+                if self.debug > 0:
+                    print(f"  max[{i}]x{skip_size}: Constraint SAT")
+                skip_d_width = i
+                break
+            else:
+                if self.debug > 0:
+                    print(f"  max[{i}x{skip_size}]: Constraint UNSAT")
+
+
+        new_maxval = 0
+        new_dwidth = 0
+        max_e = []
+        for i in range(skip_d_width)[::-1]:
+            b = ExprBinModel(
+                    ExprPartselectModel(
+                        ExprFieldRefModel(f),
+                        ExprLiteralModel(i, False, 32)),
+                    BinExprType.Eq,
+                    ExprLiteralModel(1, False, 1)
+                    )
+
+            n = b.build(btor)
+            btor.Assume(n)
+            for m in max_e:
+                btor.Assume(m)
+            if self.solve_info is not None:
+                self.solve_info.n_sat_calls += 1
+            if btor.Sat() == btor.SAT:
+                if self.debug > 0:
+                    print(f"  max[{i}]: Constraint SAT")
+                new_maxval |= (1 << i)
+                max_e.append(n)
+                if new_dwidth == 0:
+                    new_dwidth = i+1
+            else:
+                if self.debug > 0:
+                    print(f"  max[{i}]: Constraint UNSAT")
+        if self.debug > 0:
+            print("  new max: %d" % new_maxval)
+
+        t_range = (t_range[0], min(new_maxval, t_range[1]))
+        d_width = new_dwidth
+        return t_range,d_width
+
+    def find_min(self, f, btor, t_range, d_width):
+        btor.Assume(ExprBinModel(
+            ExprFieldRefModel(f),
+            BinExprType.Eq,
+            ExprLiteralModel(t_range[0], False, 32)).build(btor))
+        if self.solve_info is not None:
+            self.solve_info.n_sat_calls += 1
+        if btor.Sat() == btor.SAT:
+            if self.debug > 0:
+                print("  current min: Constraint SAT")
+            return t_range, d_width
+
+        # TODO Try out skipping here like in max
+
+        new_minval = 0
+        min_e = []
+        for i in range(d_width)[::-1]:
+            b = ExprBinModel(
+                    ExprPartselectModel(
+                        ExprFieldRefModel(f),
+                        ExprLiteralModel(i, False, 32)),
+                    BinExprType.Eq,
+                    ExprLiteralModel(0, False, 1)
+                    )
+
+            n = b.build(btor)
+            btor.Assume(n)
+            for m in min_e:
+                btor.Assume(m)
+            if self.solve_info is not None:
+                self.solve_info.n_sat_calls += 1
+            if btor.Sat() == btor.SAT:
+                if self.debug > 0:
+                    print("  min: Constraint SAT")
+                min_e.append(n)
+            else:
+                new_minval |= (1 << i)
+                if self.debug > 0:
+                    print("  min: Constraint UNSAT")
+        if self.debug > 0:
+            print("  new min: %d" % new_minval)
+
+        t_range = (max(new_minval, t_range[0]), t_range[1])
+        return t_range, d_width
+
     def _build_swizzle_constraints(self, f, bit_pattern, d_width):
         e = []
+        # TODO This can cause bias issues if dwidth is far larger than the actual maximum width
         max_intervals = 6
 
         if self.debug > 0:            
